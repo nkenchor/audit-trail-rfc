@@ -1,0 +1,15 @@
+{
+    "action": "USER_LOGGED_IN",
+    "user_id": "d7b62a8f-9a3a-4de3-9d53-b15ef8a6f982",
+    "resource_type": "User",
+    "resource_id": "d7b62a8f-9a3a-4de3-9d53-b15ef8a6f982",
+    "timestamp": "2025-05-01T10:00:00Z",
+    "ip_address": "192.168.1.100",
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    "metadata": {
+      "session_id": "xyz-123",
+      "login_method": "password"
+    },
+    "schema_version": "v1"
+  }
+  
