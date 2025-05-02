@@ -81,10 +81,13 @@
 - [8.5 Backup and Disaster Recovery Plan](#85-backup-and-disaster-recovery-plan)
 
 ### 9. Cost and Performance
-- [9.1 Cost Breakdown: Storage, Processing, Monitoring](#91-cost-breakdown-storage-processing-monitoring)
-- [9.2 Read/Write Load Estimations](#92-readwrite-load-estimations)
-- [9.3 Horizontal Scaling Plan](#93-horizontal-scaling-plan)
-- [9.4 Cost Optimization Opportunities](#94-cost-optimization-opportunities)
+- [9.1 Cost Breakdown: Detailed Estimates by Component](#91-cost-breakdown-detailed-estimates-by-component)
+- [9.2 Read/Write Load Estimates and Query Patterns](#92-readwrite-load-estimates-and-query-patterns)
+- [9.3 Cost Modeling Assumptions](#93-cost-modeling-assumptions)
+- [9.4 Horizontal Scaling Model](#94-horizontal-scaling-model)
+- [9.5 Optimization Recommendations](#95-optimization-recommendations)
+- [9.6 Tenant-Level Cost Attribution (for SaaS Contexts)](#96-tenant-level-cost-attribution-for-saas-contexts)
+
 
 ### 10. Development and Delivery Plan
 - [10.1 Delivery Assumptions and Team Composition](#101-delivery-assumptions-and-team-composition)
@@ -2241,94 +2244,115 @@ The disaster recovery plan is built around the following principles:
 
 ## 9. Cost and Performance
 
-The Audit Trail System must balance scalability, durability, and compliance without incurring unbounded infrastructure costs. This section provides an in-depth breakdown of expected cost drivers, throughput estimates, and strategies for performance tuning and cost optimization.
+The Audit Trail System is architected for **scalability**, **cost predictability**, and **compliance-grade durability**. This section provides a comprehensive breakdown of **cost drivers**, **load projections**, and **performance engineering practices** — grounded in concrete vendor pricing assumptions and operational scenarios. The aim is to support strategic decision-making across infrastructure provisioning, budgeting, and tenant-specific cost attribution.
 
 ---
 
-### 9.1 Cost Breakdown: Storage, Processing, Monitoring
+### 9.1 Cost Breakdown: Detailed Estimates by Component
 
-| Component               | Resource Type              | Cost Drivers                             | Estimation Notes                                      |
-|-------------------------|----------------------------|-------------------------------------------|--------------------------------------------------------|
-| PostgreSQL (Audit DB)   | Managed DB (RDS/Aurora)    | Storage volume, IOPS, backups             | Partitioned, append-only writes minimize churn. Index tuning and autovacuum are essential to prevent bloat. |
-| Kafka                   | Managed Kafka / MSK / Confluent | Broker count, retention, replication factor | Billed per throughput and retention volume. MSK and Confluent incur additional SaaS premiums. |
-| Object Storage          | S3 or Glacier              | Snapshot backups, WAL, purge archives     | WAL is streamed to encrypted S3 with lifecycle rules for archival and cleanup. |
-| API Service             | Kubernetes / ECS           | CPU, Memory, Pod HPA                      | Depends on ingestion peak and burst tolerance.        |
-| Monitoring              | Prometheus, Grafana, Alertmanager | Metrics volume, retention window       | Use relabeling to avoid high-cardinality metrics.     |
-| Logging                 | Loki, CloudWatch, or ELK   | Log volume and index size                 | Index only tagged fields (e.g., user_id, action).     |
-| Cache Layer (Optional) | Redis or Memcached         | Hot-path profile or identity lookups      | Reduces PostgreSQL joins and repeated user lookups.   |
+| Component               | Technology Stack              | Cost Drivers                             | Monthly Estimate (Baseline) | Notes |
+|------------------------|-------------------------------|-------------------------------------------|------------------------------|-------|
+| **Audit DB** (Primary) | AWS RDS PostgreSQL (db.m6g.large) | Storage (100 GB), IOPS (3k), backups     | ~$140                        | Assumes 30-day retention, 1M events/day @ ~1KB each. Uses partitioned writes and HOT updates. |
+| **Kafka**              | AWS MSK (2 brokers, 3 AZs)     | Broker uptime, partitions, throughput     | ~$280                        | Peak: 2K events/sec. ZSTD compression enabled. Retention: 7 days. |
+| **Archival Storage**   | AWS S3 + Glacier               | 90-day retention (cold logs, WAL files)   | ~$35                         | 3-tiered lifecycle: hot (S3), infrequent access, cold (Glacier Deep Archive). |
+| **Frontend/API Relay** | FastAPI on ECS Fargate (1 vCPU, 2GB RAM, autoscaled) | Container runtime, ingress volume        | ~$90                         | Auto-scales with request volume. |
+| **Monitoring & Logging** | Prometheus + Grafana (self-hosted), Loki for logs | Metrics volume, scrape interval, log retention | ~$60 (infra only)      | Cost-effective stack with 14-day metric and 7-day log retention. |
+| **Search Layer (Optional)** | OpenSearch / Elasticsearch (t3.medium x 2) | Index volume, shard count, query rate    | ~$150                        | Enables user-side audit queries and fast compliance filtering. |
+| **Cache Layer**        | AWS ElastiCache (Redis, cache.t3.micro) | Low-latency identity/org lookups         | ~$40                         | Optimizes report queries that join audit and org/user data. |
 
-> In SaaS deployments, cost attribution per tenant is supported via:
-> - Partitioned usage metrics (e.g., per-tenant event count)
-> - Metadata tags for tenant and product tier
-
----
-
-### 9.2 Read/Write Load Estimations
-
-Load estimates are derived from a mid-sized SaaS system (e.g., 100k DAUs, 50 services emitting events).
-
-#### Write Load (Audit Event Ingestion)
-
-- **Peak throughput**: 1,500–2,000 events/sec  
-- **Sustained average**: 600–800 events/sec  
-- **Payload size**: 1–3 KB per event  
-- **Kafka partition count**: 24–36 (based on hash of tenant_id + action)
-
-Kafka brokers and DB writers are horizontally scalable to match this load.
-
-#### Read Load (Audit Querying)
-
-- Admin dashboards: Low-frequency, high-filter queries  
-- Compliance reports: Monthly exports with filters (e.g., action=LOGIN, region=EU)  
-- User-facing self-audit endpoints: ~20–50 reads/sec (typically paginated)
-
-Read load is handled via indexed partitions and optional materialized views or columnar replicas.
+> **Total Baseline Monthly Estimate**: **~$795 – $900**, excluding optional search layer.
+> 
+> Estimates are based on **AWS us-east-1 pricing (April 2025)** and reflect a **mid-sized SaaS** platform with ~100K DAUs and ~50 services emitting logs.
 
 ---
 
-#### 9.2.1 Query Pattern Cost Considerations
+### 9.2 Read/Write Load Estimates and Query Patterns
 
-Certain audit queries can be computationally expensive, especially:
+#### Write Load – Audit Event Ingestion
 
-- Wildcard searches across `action`, `actor`, or `tenant_id`
-- Time-range filters over unindexed timestamp fields
-- Complex joins (e.g., combining audit + user profile + org hierarchy)
+| Metric                | Value                            |
+|-----------------------|----------------------------------|
+| **Peak throughput**   | 2,000 events/sec (bursts)        |
+| **Sustained average** | 800 events/sec                   |
+| **Payload size**      | 1–2 KB/event                     |
+| **Partition count**   | 36 Kafka partitions              |
+| **Daily ingestion**   | ~1M–2M events/day                |
 
-Mitigation strategies:
-- Add dedicated indexes for high-frequency filters
-- Pre-aggregate monthly usage stats for dashboards
+- Load distribution is tenant-aware and partitioned by `tenant_id + event_type`.
+- Producers (SDKs) push asynchronously to Kafka to decouple backend pressure.
+
+#### Read Load – Audit Querying
+
+| Use Case                   | Frequency         | Load Strategy                         |
+|----------------------------|-------------------|----------------------------------------|
+| Admin Dashboard            | Low (interactive) | Filtered queries on time + actor/action |
+| Regulatory Exports (GDPR)  | Monthly/On-demand | Materialized views + query templates   |
+| Self-Audit Endpoints       | Medium (API)      | Paginated queries via partition keys   |
+| Analytics Dashboards       | High (aggregates) | Columnar replica or OLAP export        |
+
+> **Query Mitigations**:
+> - Use **BRIN** indexes for time-based range filters.
+> - Enable **GIN** on JSONB metadata (select fields only).
+> - Avoid cross-join-heavy reports by leveraging **pre-aggregated materialized views** and **cache-backed** actor/org lookups.
 
 ---
 
-### 9.3 Horizontal Scaling Plan
+### 9.3 Cost Modeling Assumptions
 
-The system supports horizontal scale-out to handle load growth or tenant onboarding:
+The following modeling assumptions support cost sensitivity and planning:
+
+- **1M logs/day**, 30-day hot retention → ~30 GB/month + 10–15% index bloat.
+- **Compression**: ZSTD (Kafka) + pg_lz (Postgres) → ~50–70% size reduction.
+- **Backup S3 Usage**: 30 days (hot) + 90 days (Glacier) → ~5–10 GB/month.
+- **Kafka throughput pricing** assumes ~200 GiB/month ingress @ $0.10/GiB.
+- Monitoring stack tuned for 14-day cardinality control.
+
+---
+
+### 9.4 Horizontal Scaling Model
 
 | Component           | Scaling Mechanism                              | Notes                                               |
 |---------------------|-------------------------------------------------|-----------------------------------------------------|
-| Kafka               | Add partitions per topic                        | Partition rebalancing with minimal disruption       |
-| Consumers           | Stateless workers via Kubernetes HPA            | Pod autoscaling based on Kafka lag and CPU usage    |
-| API Gateway         | Load-balanced FastAPI replicas                  | Metrics-based autoscaling (e.g., req/sec, latency)  |
-| PostgreSQL          | Partitioned tables, connection pooling          | Read replicas for reports; bloat monitored via autovacuum |
-| Monitoring Stack    | Sharded Prometheus + Thanos (if needed)         | Centralized long-term metric retention              |
+| **Kafka**           | Add brokers & partitions                       | Kafka Streams partitions allow event ordering and parallelism |
+| **API Services**    | ECS/K8s-based HPA                               | Metrics-based auto-scaling using CPU & queue lag    |
+| **Consumers**       | Stateless microservices (async workers)        | Scaled based on Kafka lag and event volume          |
+| **PostgreSQL**      | Read replicas, time-partitioned tables         | WAL shipping for failover; active-active optional   |
+| **Monitoring**      | Thanos for long-term metrics retention         | Push model + external object storage supported      |
+
+> All components support **tenancy-aware horizontal scaling** with built-in multi-AZ fault tolerance and service-mesh-based service discovery.
 
 ---
 
-### 9.4 Cost Optimization Opportunities
+### 9.5 Optimization Recommendations
 
-To minimize cost while maintaining performance:
-
-- **Tiered Storage**: Use S3 Glacier for cold backups, especially for expired partitions.  
-- **Index Optimization**: Only index actionable fields (e.g., `actor_id`, `action`) to reduce DB size and avoid index bloat.  
-- **Compression**: Enable gzip or ZSTD compression for Kafka topics and S3 buckets.  
-- **Downsampling Metrics**: Use aggregated views (e.g., hourly P99 latency) for metrics.  
-- **Event Filtering**: Drop low-priority events (e.g., heartbeats) at SDK or Kafka edge.  
-- **Cached Lookups**: Use Redis/Memcached to cache actor or org lookups during high-volume queries.  
-- **PostgreSQL Maintenance**: Schedule autovacuum and analyze jobs tuned for append-only workloads to prevent table and index bloat.
+| Strategy                        | Benefit                                      |
+|--------------------------------|----------------------------------------------|
+| Tiered Storage (S3 Glacier)    | Reduces long-term costs for archived logs    |
+| Smart Indexing                 | Optimizes query latency and storage usage    |
+| Event Filtering at Source      | Avoids unnecessary ingestion of low-value logs |
+| SDK-Level Schema Validation    | Shifts error detection away from ingestion pipeline |
+| Redis Lookup Cache             | Minimizes repeat user/org DB joins           |
+| Downsampling Metrics           | Reduces Prometheus cardinality and costs     |
+| Scheduled PostgreSQL Vacuuming | Prevents index and table bloat               |
 
 ---
 
-Overall, the Audit Trail System is designed to operate at scale with cost predictability, performance observability, and tenant-aware elasticity.
+### 9.6 Tenant-Level Cost Attribution (for SaaS Contexts)
+
+The system supports **per-tenant cost analysis** using:
+
+- Metadata tagging (e.g., `x-tenant-id`, `plan_tier`)
+- Isolated Kafka partitions or topics per tenant
+- Partitioned table usage and ingestion metrics
+- Monthly billing reports exportable from observability layer
+
+This enables differentiated **billing models**, **capacity planning**, and **data sovereignty enforcement**.
+
+---
+
+### Summary
+
+The Audit Trail System is engineered to **scale predictably**, **operate cost-efficiently**, and **deliver compliance-grade guarantees**. Backed by measured assumptions, per-component estimations, and mitigation plans, this cost model empowers both **product teams** and **infrastructure engineers** to plan, monitor, and optimize platform usage effectively — across tenants, environments, and regulatory boundaries.
 
 ---
 
@@ -2435,6 +2459,22 @@ The delivery plan assumes the following setup:
 
 > **Gantt Chart**  
 
+![Gantt Chart](diagrams/gantt-chart.png)
+
+
+### Gantt Chart Breakdown
+
+The following table outlines the milestone-based delivery timeline for the Audit Trail System. Each sprint spans one to two weeks, with clearly defined dependencies and deliverables. The plan follows a sequential build-up—from foundational setup to ingestion, persistence, security layers, compliance tooling, and final handover—ensuring that critical capabilities are delivered incrementally and predictably.
+
+| Milestone                           | Start Date    | End Date      | Duration | Dependencies | Notes                                           |
+|-------------------------------------|---------------|---------------|----------|---------------|-------------------------------------------------|
+| Sprint 0: Bootstrapping & Foundations | May 5, 2025   | May 9, 2025   | 1 week   | None          | Repos, schema, CI/CD, infra setup              |
+| Sprint 1: SDKs + Ingestion MVP       | May 12, 2025  | May 23, 2025  | 2 weeks  | Sprint 0      | SDKs, ingestion service, DLQ, validation       |
+| Sprint 2: Persistence & Metrics      | May 26, 2025  | June 6, 2025  | 2 weeks  | Sprint 1      | DB schema, redaction flag, observability       |
+| Sprint 3: Secure APIs & Redaction    | June 9, 2025  | June 20, 2025 | 2 weeks  | Sprint 2      | RBAC APIs, GDPR pipelines, dashboards          |
+| Sprint 4: CI/CD & Secrets            | June 23, 2025 | July 4, 2025  | 2 weeks  | Sprint 3      | Pipelines, rollback, Vault, DevSecOps          |
+| Sprint 5: Admin UI & Compliance      | July 7, 2025  | July 18, 2025 | 2 weeks  | Sprint 4      | Admin dashboard, archival, GDPR flows          |
+| Handover & Docs Finalization         | July 21, 2025 | July 25, 2025 | 1 week   | Sprint 5      | Docs, playbooks, onboarding material           |
 
 
 ---
